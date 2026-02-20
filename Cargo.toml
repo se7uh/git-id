@@ -2,6 +2,15 @@
 name = "git-id"
 version = "1.0.0"
 edition = "2024"
+license = "MIT"
+publish = ["crates-io"]
+authors = ["John Thor <lucknite7@gmail.com>"]
+categories = ["command-line-utilities"]
+keywords = ["git", "cli", "profile", "github", "gitlab"]
+readme = "README.md"
+repository = "https://github.com/se7uh/git-id"
+homepage = "https://github.com/se7uh/git-id"
+description = "A command-line tool to manage any number of GitHub/GitLab accounts on one machine."
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
