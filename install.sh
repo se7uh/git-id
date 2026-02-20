@@ -32,9 +32,17 @@ esac
 # Fetch the latest release download URL
 API_URL="https://api.github.com/repos/$REPO/releases/latest"
 if command -v curl >/dev/null 2>&1; then
-  DOWNLOAD_URL="$(curl -fsSL "$API_URL" | grep '"browser_download_url"' | grep "$ASSET" | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')"
+  if command -v jq >/dev/null 2>&1; then
+    DOWNLOAD_URL="$(curl -fsSL "$API_URL" | jq -r --arg name "$ASSET" '.assets[] | select(.name == $name) | .browser_download_url' | head -n 1)"
+  else
+    DOWNLOAD_URL="$(curl -fsSL "$API_URL" | grep '"browser_download_url"' | grep "$ASSET" | sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  fi
 elif command -v wget >/dev/null 2>&1; then
-  DOWNLOAD_URL="$(wget -qO- "$API_URL" | grep '"browser_download_url"' | grep "$ASSET" | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')"
+  if command -v jq >/dev/null 2>&1; then
+    DOWNLOAD_URL="$(wget -qO- "$API_URL" | jq -r --arg name "$ASSET" '.assets[] | select(.name == $name) | .browser_download_url' | head -n 1)"
+  else
+    DOWNLOAD_URL="$(wget -qO- "$API_URL" | grep '"browser_download_url"' | grep "$ASSET" | sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  fi
 else
   echo "curl or wget is required" >&2
   exit 1
