@@ -78,7 +78,7 @@ jobs:
       - name: Get version from Cargo.toml
         id: version
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
