@@ -77,7 +77,6 @@ pub enum SshCommands {
     Config,
 }
 
-/// Build the clap `Command` (used for shell completions).
 pub fn build_command() -> clap::Command {
     Cli::command()
 }
