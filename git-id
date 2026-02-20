@@ -1,0 +1,1047 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+git-id — Manage multiple GitHub accounts on one Linux machine.
+
+Handles three things at once:
+  • Git commit identity  (user.name / user.email)
+  • SSH keys + ssh-agent  (generate, pick, load)
+  • ~/.ssh/config generation  (idempotent marker blocks)
+
+Identifier: username (GitHub username). If the same username exists on
+multiple hosts (e.g. GitHub.com + GitHub Enterprise), use username@host:
+    git-id use johndoe                   # unambiguous
+    git-id use johndoe@corp.github.com   # disambiguate
+
+Language choice: Python 3 (stdlib only; fzf is an optional enhancement)
+  - tomllib (≥3.11) for TOML; custom fallback for older versions
+  - pathlib / subprocess / argparse cover all system needs
+  - Safer string/file handling than bash; no quoting pitfalls
+
+Install:
+    chmod +x git-id
+    sudo ln -sf "$(pwd)/git-id" /usr/local/bin/git-id
+
+Exit codes:
+    0  success
+    1  general error
+    2  bad input / usage error
+"""
+
+import argparse
+import datetime
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# ─── TOML support ──────────────────────────────────────────────────────────────
+try:
+    import tomllib  # Python ≥ 3.11
+
+    def _toml_loads(s: str) -> dict:
+        return tomllib.loads(s)
+
+except ImportError:
+    def _toml_loads(s: str) -> dict:  # type: ignore[misc]
+        """Minimal TOML parser for [[accounts]] array-of-tables format."""
+        result: dict = {"accounts": []}
+        current: Optional[dict] = None
+        for raw in s.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line == "[[accounts]]":
+                current = {}
+                result["accounts"].append(current)
+                continue
+            if current is not None and "=" in line:
+                key, _, rest = line.partition("=")
+                key = key.strip()
+                val: object = rest.strip()
+                assert isinstance(val, str)
+                if val.startswith(('"', "'")):
+                    q = val[0]
+                    end = val.find(q, 1)
+                    val = val[1:end] if end != -1 else val[1:]
+                elif val.lower() in ("true", "false"):
+                    val = val.lower() == "true"
+                else:
+                    val = val.split("#")[0].strip()
+                current[key] = val
+        return result
+
+
+# ─── Constants ─────────────────────────────────────────────────────────────────
+CONFIG_DIR    = Path.home() / ".config" / "git-id"
+ACCOUNTS_FILE = CONFIG_DIR / "accounts.toml"
+SSH_CONFIG    = Path.home() / ".ssh" / "config"
+SSH_DIR       = Path.home() / ".ssh"
+
+# Marker format — uses the fully-qualified id (username@host) to stay unique
+# even when the same username exists on multiple hosts.
+MARKER_S = "# >>> git-id: {id} >>>"
+MARKER_E = "# <<< git-id: {id} <<<"
+
+EXIT_OK    = 0
+EXIT_ERR   = 1
+EXIT_INPUT = 2
+
+# username is the primary key; label field is gone
+ACCOUNT_FIELDS = ["username", "email", "host", "ssh_key", "https_token"]
+
+EXAMPLE_TOML = """\
+# git-id accounts — managed by git-id (safe to edit manually)
+#
+# Add one [[accounts]] section per GitHub identity.
+# username is the unique identifier used in all commands.
+# If you have the same username on multiple hosts, use username@host
+# to disambiguate (e.g.  git-id use johndoe@corp.github.com).
+#
+# Example (uncomment and fill in):
+#
+# [[accounts]]
+# username     = "johndoe"
+# email        = "john@example.com"
+# host         = "github.com"
+# ssh_key      = "~/.ssh/id_ed25519_johndoe"
+# https_token  = ""          # optional PAT for HTTPS fallback
+#
+# [[accounts]]
+# username     = "johndoe"           # same username, different host
+# email        = "john@corp.com"
+# host         = "corp.github.com"   # GitHub Enterprise
+# ssh_key      = "~/.ssh/id_ed25519_johndoe-corp"
+# https_token  = "ghp_xxxxxxxxxxxxxxxxxxxx"
+"""
+
+
+# ─── ANSI colour helpers ───────────────────────────────────────────────────────
+def _tty() -> bool:
+    return sys.stdout.isatty()
+
+
+def _c(code: str, text: str) -> str:
+    if not _tty():
+        return text
+    CODES = {
+        "bold": "1", "dim": "2",
+        "red": "31", "green": "32", "yellow": "33",
+        "blue": "34", "magenta": "35", "cyan": "36",
+    }
+    return f"\033[{CODES.get(code, '0')}m{text}\033[0m"
+
+
+def ok(msg: str)   -> None: print(f"{_c('green',  '✓')} {msg}")
+def warn(msg: str) -> None: print(f"{_c('yellow', '!')} {msg}", file=sys.stderr)
+def err(msg: str)  -> None: print(f"{_c('red',    '✗')} {msg}", file=sys.stderr)
+def info(msg: str) -> None: print(f"{_c('cyan',   '→')} {msg}")
+def hdr(msg: str)  -> None: print(f"\n{_c('bold', msg)}")
+
+
+def die(msg: str, code: int = EXIT_ERR) -> None:
+    err(msg)
+    sys.exit(code)
+
+
+# ─── Backup helper ─────────────────────────────────────────────────────────────
+def backup(path: Path) -> Optional[Path]:
+    """Copy path → path.bak.<timestamp>. Returns backup path, or None if missing."""
+    if not path.exists():
+        return None
+    ts  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dst = path.parent / f"{path.name}.bak.{ts}"
+    shutil.copy2(path, dst)
+    info(f"Backed up {path.name} → {dst.name}")
+    return dst
+
+
+# ─── TOML writer ───────────────────────────────────────────────────────────────
+def _accounts_to_toml(accounts: List[Dict]) -> str:
+    lines = [
+        "# git-id accounts — managed by git-id (safe to edit manually)",
+        "# Add a new [[accounts]] section to register another identity.",
+        "",
+    ]
+    for acc in accounts:
+        lines.append("[[accounts]]")
+        for k in ACCOUNT_FIELDS:
+            v = acc.get(k, "")
+            escaped = str(v).replace("\\", "\\\\").replace('"', '\\"')
+            lines.append(f'{k} = "{escaped}"')
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+# ─── Account helpers ───────────────────────────────────────────────────────────
+def load_accounts() -> List[Dict]:
+    if not ACCOUNTS_FILE.exists():
+        return []
+    try:
+        data = _toml_loads(ACCOUNTS_FILE.read_text())
+        return data.get("accounts", [])
+    except Exception as exc:
+        die(f"Failed to parse {ACCOUNTS_FILE}: {exc}")
+        return []
+
+
+def save_accounts(accounts: List[Dict], dry_run: bool = False) -> None:
+    content = _accounts_to_toml(accounts)
+    if dry_run:
+        info("[dry-run] Would write accounts.toml:")
+        print(content)
+        return
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    backup(ACCOUNTS_FILE)
+    ACCOUNTS_FILE.write_text(content)
+    ok(f"Saved {ACCOUNTS_FILE}")
+
+
+def _account_id(acc: Dict) -> str:
+    """
+    Stable unique identifier for SSH config markers and internal use.
+    Always username@host — guaranteed unique even across GHE instances.
+    """
+    return f"{acc.get('username', '?')}@{acc.get('host', 'github.com')}"
+
+
+def find_account(key: str) -> Optional[Dict]:
+    """
+    Resolve a CLI key to an account.
+
+    Accepts:
+      username           — unique match across all hosts
+      username@host      — explicit host disambiguation
+
+    If the bare username matches exactly one account → return it.
+    If it matches multiple accounts → error with hint to use username@host.
+    """
+    accounts = load_accounts()
+
+    if "@" in key:
+        uname, _, host = key.partition("@")
+        for acc in accounts:
+            if acc.get("username") == uname and acc.get("host") == host:
+                return acc
+        return None
+
+    # Bare username
+    matches = [a for a in accounts if a.get("username") == key]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        hints = "  or  ".join(
+            f"'{key}@{a.get('host', 'github.com')}'" for a in matches
+        )
+        die(
+            f"Multiple accounts with username '{key}'.\n"
+            f"  Specify host to disambiguate: {hints}",
+            EXIT_INPUT,
+        )
+    return None
+
+
+def ensure_accounts_file() -> None:
+    if not ACCOUNTS_FILE.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        ACCOUNTS_FILE.write_text(EXAMPLE_TOML)
+        info(f"Created {ACCOUNTS_FILE} (no accounts yet — run 'git-id add')")
+
+
+# ─── Interactive helpers ────────────────────────────────────────────────────────
+def prompt(msg: str, default: str = "", required: bool = True) -> str:
+    hint = f" [{_c('dim', default)}]" if default else ""
+    while True:
+        try:
+            val = input(f"  {_c('cyan', msg)}{hint}: ").strip()
+        except EOFError:
+            die("\nAborted.", EXIT_INPUT)
+        val = val or default
+        if val or not required:
+            return val
+        warn("  This field is required.")
+
+
+def prompt_choice(msg: str, choices: List[str], default: int = 0) -> str:
+    print(f"\n  {_c('cyan', msg)}:")
+    for i, ch in enumerate(choices):
+        marker = _c("green", "●") if i == default else _c("dim", "○")
+        print(f"    {_c('dim', str(i + 1))}  {marker}  {ch}")
+    while True:
+        raw = input(f"  Enter number [default: {default + 1}]: ").strip()
+        if not raw:
+            return choices[default]
+        if raw.isdigit() and 1 <= int(raw) <= len(choices):
+            return choices[int(raw) - 1]
+        warn(f"  Enter a number between 1 and {len(choices)}")
+
+
+def choose_from_list(items: List[str], prompt_str: str = "Select") -> Optional[str]:
+    """Use fzf when available; otherwise fall back to numbered menu."""
+    if not items:
+        return None
+    if shutil.which("fzf"):
+        proc = subprocess.run(
+            ["fzf", "--prompt", f"{prompt_str} > ", "--height", "40%", "--reverse"],
+            input="\n".join(items), text=True, capture_output=True,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else None
+    print(f"\n  {_c('cyan', prompt_str + ':')}")
+    for i, item in enumerate(items):
+        print(f"    {_c('dim', str(i + 1))}  {item}")
+    raw = input("  Enter number (or q to quit): ").strip()
+    if raw.lower() == "q" or not raw:
+        return None
+    if raw.isdigit() and 1 <= int(raw) <= len(items):
+        return items[int(raw) - 1]
+    return None
+
+
+# ─── SSH helpers ───────────────────────────────────────────────────────────────
+def _run(args: List[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(args, text=True, capture_output=True, **kwargs)
+
+
+def _default_key_path(username: str) -> Path:
+    return SSH_DIR / f"id_ed25519_{username}"
+
+
+def gen_ssh_key(username: str, email: str, dry_run: bool = False) -> Path:
+    """Generate an ed25519 key named id_ed25519_<username>, then add to agent."""
+    key = _default_key_path(username)
+    if key.exists():
+        warn(f"Key {key} already exists — skipping (delete it first to regenerate)")
+        return key
+
+    SSH_DIR.mkdir(mode=0o700, exist_ok=True)
+    cmd = ["ssh-keygen", "-t", "ed25519", "-C", email, "-f", str(key), "-N", ""]
+
+    if dry_run:
+        info(f"[dry-run] Would run: {' '.join(cmd)}")
+        return key
+
+    result = _run(cmd)
+    if result.returncode != 0:
+        die(f"ssh-keygen failed: {result.stderr.strip()}")
+
+    key.chmod(0o600)
+    pub = key.with_suffix(".pub")
+    if pub.exists():
+        pub.chmod(0o644)
+
+    ok(f"Generated {key}")
+    add_key_to_agent(key, dry_run=False)
+    return key
+
+
+def add_key_to_agent(key: Path, dry_run: bool = False) -> None:
+    if not key.exists():
+        warn(f"Key {key} not found — cannot add to ssh-agent")
+        return
+    if dry_run:
+        info(f"[dry-run] Would run: ssh-add {key}")
+        return
+    if not os.environ.get("SSH_AUTH_SOCK"):
+        warn("SSH_AUTH_SOCK not set — ssh-agent may not be running")
+    result = _run(["ssh-add", str(key)])
+    if result.returncode == 0:
+        ok(f"Added {key} to ssh-agent")
+    else:
+        warn(f"ssh-add failed (is ssh-agent running?): {result.stderr.strip()}")
+
+
+def fix_key_permissions(key: Path) -> None:
+    if key.exists():
+        key.chmod(0o600)
+        ok(f"chmod 600 {key}")
+    pub = key.with_suffix(".pub")
+    if pub.exists():
+        pub.chmod(0o644)
+        ok(f"chmod 644 {pub}")
+
+
+# ─── SSH config ────────────────────────────────────────────────────────────────
+def _ssh_host_alias(acc: Dict) -> str:
+    """
+    SSH Host alias: <host>-<username>
+    e.g.  github.com-johndoe   or   corp.github.com-johndoe
+    """
+    return f"{acc.get('host', 'github.com')}-{acc.get('username', '?')}"
+
+
+def _make_stanza(acc: Dict) -> str:
+    acct_id = _account_id(acc)          # username@host  (marker key)
+    alias   = _ssh_host_alias(acc)      # host-username  (Host alias)
+    host    = acc.get("host", "github.com")
+    keyfile = acc.get("ssh_key") or f"~/.ssh/id_ed25519_{acc.get('username', '?')}"
+    return (
+        f"{MARKER_S.format(id=acct_id)}\n"
+        f"Host {alias}\n"
+        f"    HostName {host}\n"
+        f"    User git\n"
+        f"    IdentityFile {keyfile}\n"
+        f"    IdentitiesOnly yes\n"
+        f"{MARKER_E.format(id=acct_id)}\n"
+    )
+
+
+def update_ssh_config(accounts: List[Dict], dry_run: bool = False) -> None:
+    """
+    Write/merge one stanza per account into ~/.ssh/config using marker blocks.
+    Existing non-git-id content is preserved. Idempotent.
+    """
+    SSH_DIR.mkdir(mode=0o700, exist_ok=True)
+    existing = SSH_CONFIG.read_text() if SSH_CONFIG.exists() else ""
+
+    for acc in accounts:
+        acct_id = _account_id(acc)
+        stanza  = _make_stanza(acc)
+        start_m = re.escape(MARKER_S.format(id=acct_id))
+        end_m   = re.escape(MARKER_E.format(id=acct_id))
+        pattern = re.compile(rf"{start_m}.*?{end_m}\n?", re.DOTALL)
+        if pattern.search(existing):
+            existing = pattern.sub(stanza, existing)
+        else:
+            existing = existing.rstrip("\n") + "\n\n" + stanza
+
+    if dry_run:
+        info("[dry-run] Would write ~/.ssh/config:")
+        print(existing)
+        return
+
+    backup(SSH_CONFIG)
+    SSH_CONFIG.write_text(existing)
+    SSH_CONFIG.chmod(0o600)
+    ok(f"Updated {SSH_CONFIG}")
+
+
+# ─── Git helpers ───────────────────────────────────────────────────────────────
+def _git(*args: str) -> Tuple[int, str, str]:
+    r = subprocess.run(["git"] + list(args), text=True, capture_output=True)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def in_git_repo() -> bool:
+    code, _, _ = _git("rev-parse", "--git-dir")
+    return code == 0
+
+
+def get_git_config(key: str, scope: str = "local") -> str:
+    code, out, _ = _git("config", f"--{scope}", key)
+    return out if code == 0 else ""
+
+
+def set_git_config(key: str, value: str, scope: str = "local",
+                   dry_run: bool = False) -> None:
+    if dry_run:
+        info(f"[dry-run] git config --{scope} {key} {value!r}")
+        return
+    code, _, errmsg = _git("config", f"--{scope}", key, value)
+    if code != 0:
+        warn(f"git config --{scope} {key}: {errmsg}")
+
+
+def get_remote_url(remote: str = "origin") -> str:
+    code, url, _ = _git("remote", "get-url", remote)
+    return url if code == 0 else ""
+
+
+def parse_remote_url(url: str) -> Optional[Tuple[str, str, str, str]]:
+    """
+    Returns (fmt, host, owner, repo).
+
+    SSH:   git@<host>-<username>:<owner>/<repo>[.git]
+           git@<host>:<owner>/<repo>[.git]
+    HTTPS: https://[token@]<host>/<owner>/<repo>[.git]
+    """
+    # SSH: git@<host-possibly-with-alias>:<owner>/<repo>
+    m = re.match(r"git@([^:]+):([^/]+)/(.+?)(?:\.git)?$", url)
+    if m:
+        raw_host = m.group(1)
+        # Strip "-<username>" suffix to get the real hostname
+        # e.g. github.com-johndoe → github.com
+        host = re.sub(r"-[^.-][^.]*$", "", raw_host) if "-" in raw_host else raw_host
+        return ("ssh", host, m.group(2), m.group(3))
+
+    # HTTPS: https://[token@]<host>/<owner>/<repo>
+    m = re.match(r"https://(?:[^@]+@)?([^/]+)/([^/]+)/(.+?)(?:\.git)?$", url)
+    if m:
+        return ("https", m.group(1), m.group(2), m.group(3))
+
+    return None
+
+
+def build_ssh_url(acc: Dict, owner: str, repo: str) -> str:
+    alias = _ssh_host_alias(acc)
+    return f"git@{alias}:{owner}/{repo}.git"
+
+
+def build_https_url(token: str, host: str, owner: str, repo: str) -> str:
+    if token:
+        return f"https://{token}@{host}/{owner}/{repo}.git"
+    return f"https://{host}/{owner}/{repo}.git"
+
+
+def set_remote_url(remote: str, url: str, dry_run: bool = False) -> None:
+    if dry_run:
+        info(f"[dry-run] git remote set-url {remote} {url}")
+        return
+    code, _, errmsg = _git("remote", "set-url", remote, url)
+    if code != 0:
+        warn(f"Could not set remote URL: {errmsg}")
+    else:
+        ok(f"Remote '{remote}' → {url}")
+
+
+def _repo_name() -> str:
+    _, out, _ = _git("rev-parse", "--show-toplevel")
+    return Path(out).name if out else "."
+
+
+# ─── Command: add ──────────────────────────────────────────────────────────────
+def cmd_add(args: argparse.Namespace) -> None:
+    ensure_accounts_file()
+    accounts = load_accounts()
+
+    hdr("Add a new GitHub account")
+    print()
+
+    username = prompt("GitHub username")
+    host     = prompt("Host", default="github.com")
+
+    # Collision check
+    if any(a.get("username") == username and a.get("host") == host for a in accounts):
+        die(
+            f"Account '{username}@{host}' already exists. "
+            f"Remove it first with: git-id remove {username}@{host}",
+            EXIT_INPUT,
+        )
+
+    email = prompt("Commit email")
+
+    remote_type = prompt_choice(
+        "Remote type",
+        ["ssh — use SSH keys (recommended)", "https — use personal access token", "both — configure SSH and HTTPS"],
+        default=0,
+    )
+    use_ssh   = "ssh"   in remote_type or "both" in remote_type
+    use_https = "https" in remote_type or "both" in remote_type
+
+    # ── SSH key ────────────────────────────────────────────────────────────────
+    ssh_key_path = ""
+    if use_ssh:
+        hdr("SSH Key")
+        key_action = prompt_choice(
+            "SSH key setup",
+            [
+                f"Generate new ed25519 key  (~/.ssh/id_ed25519_{username})",
+                "Pick from existing ~/.ssh/*.pub keys",
+            ],
+            default=0,
+        )
+
+        if "Generate" in key_action:
+            new_key = gen_ssh_key(username, email, dry_run=args.dry_run)
+            ssh_key_path = str(new_key)
+            pub = new_key.with_suffix(".pub")
+            if pub.exists() and not args.dry_run:
+                hdr("Public key — paste this into GitHub → Settings → SSH keys:")
+                print(f"\n{pub.read_text().strip()}\n")
+        else:
+            pub_files = sorted(SSH_DIR.glob("*.pub"))
+            if not pub_files:
+                warn("No .pub files found in ~/.ssh/ — generating a new key instead")
+                new_key = gen_ssh_key(username, email, dry_run=args.dry_run)
+                ssh_key_path = str(new_key)
+            else:
+                chosen = choose_from_list([str(p) for p in pub_files], "Pick public key")
+                if not chosen:
+                    die("No key selected.", EXIT_INPUT)
+                priv = Path(chosen).with_suffix("")
+                if not priv.exists():
+                    warn(f"Private key not found: {priv}")
+                    yn = input("  Generate a new ed25519 key instead? [y/N]: ").strip().lower()
+                    if yn == "y":
+                        new_key = gen_ssh_key(username, email, dry_run=args.dry_run)
+                        ssh_key_path = str(new_key)
+                    else:
+                        die("Cannot proceed without a valid private key.", EXIT_INPUT)
+                else:
+                    ssh_key_path = str(priv)
+                    fix_key_permissions(priv)
+                    add_key_to_agent(priv, dry_run=args.dry_run)
+
+    # ── HTTPS token ───────────────────────────────────────────────────────────
+    https_token = ""
+    if use_https:
+        hdr("HTTPS Token")
+        https_token = prompt("GitHub personal access token (PAT)", required=False)
+
+    acc: Dict = {
+        "username":    username,
+        "email":       email,
+        "host":        host,
+        "ssh_key":     ssh_key_path,
+        "https_token": https_token,
+    }
+    accounts.append(acc)
+    save_accounts(accounts, dry_run=args.dry_run)
+
+    if ssh_key_path:
+        update_ssh_config(accounts, dry_run=args.dry_run)
+
+    print()
+    ok(f"Account '{username}@{host}' added!")
+    info(f"Next: git-id use {username}   (inside a repo)  or  git-id use {username} --global")
+
+
+# ─── Command: list ─────────────────────────────────────────────────────────────
+def cmd_list(args: argparse.Namespace) -> None:
+    ensure_accounts_file()
+    accounts = load_accounts()
+
+    if not accounts:
+        info("No accounts configured yet. Run: git-id add")
+        info(f"Config file: {ACCOUNTS_FILE}")
+        return
+
+    in_repo      = in_git_repo()
+    local_email  = get_git_config("user.email", "local")  if in_repo else ""
+    global_email = get_git_config("user.email", "global")
+
+    hdr(f"Configured accounts  ({len(accounts)} total)")
+
+    for acc in accounts:
+        username = acc.get("username", "?")
+        email    = acc.get("email",    "?")
+        host     = acc.get("host",     "github.com")
+        ssh_key  = Path(acc.get("ssh_key", "") or "").expanduser()
+        token    = acc.get("https_token", "")
+
+        priv_ok = _c("green", "✓") if (ssh_key.name and ssh_key.exists())                      else _c("red", "✗")
+        pub_ok  = _c("green", "✓") if (ssh_key.name and ssh_key.with_suffix(".pub").exists())  else _c("red", "✗")
+        tok_ok  = _c("green", "✓") if token else _c("dim", "–")
+
+        tags = ""
+        if email and email == local_email:
+            tags += "  " + _c("green",  "[active:local]")
+        if email and email == global_email:
+            tags += "  " + _c("yellow", "[active:global]")
+
+        ssh_display = str(ssh_key) if ssh_key.name else _c("dim", "(none)")
+        alias       = _ssh_host_alias(acc)
+
+        print(
+            f"\n  {_c('bold', username)}  {_c('dim', host)}{tags}\n"
+            f"    email  : {email}\n"
+            f"    ssh    : {ssh_display}  priv:{priv_ok}  pub:{pub_ok}\n"
+            f"    token  : {tok_ok}\n"
+            f"    alias  : {alias}"
+        )
+    print()
+
+
+# ─── Command: use ──────────────────────────────────────────────────────────────
+def cmd_use(args: argparse.Namespace) -> None:
+    acc = find_account(args.username)
+    if not acc:
+        die(f"Account '{args.username}' not found. Run: git-id list", EXIT_INPUT)
+
+    scope = "global" if args.glob else "local"
+    if scope == "local" and not in_git_repo():
+        die("Not inside a git repository. Use --global or cd into a repo.", EXIT_INPUT)
+
+    set_git_config("user.name",  acc["username"], scope, dry_run=args.dry_run)
+    set_git_config("user.email", acc["email"],    scope, dry_run=args.dry_run)
+    ok(f"Git identity ({scope}): {acc['username']} <{acc['email']}>")
+
+    if scope == "local":
+        _update_remote_origin(acc, args)
+
+
+def _update_remote_origin(acc: Dict, args: argparse.Namespace) -> None:
+    token = acc.get("https_token", "")
+    ssh_key = acc.get("ssh_key", "")
+
+    remote_url = get_remote_url("origin")
+    if not remote_url:
+        info("No 'origin' remote — skipping remote URL update (identity set)")
+        return
+
+    parsed = parse_remote_url(remote_url)
+    if not parsed:
+        warn(f"Unrecognised remote URL format: {remote_url!r} — skipping")
+        return
+
+    current_fmt, host, owner, repo = parsed
+
+    if args.force_ssh and args.force_https:
+        die("Cannot use --ssh and --https together.", EXIT_INPUT)
+    if args.force_ssh:
+        target_fmt = "ssh"
+    elif args.force_https:
+        target_fmt = "https"
+    else:
+        target_fmt = current_fmt
+
+    if target_fmt == "ssh":
+        if not ssh_key:
+            warn("No SSH key configured for this account; falling back to HTTPS")
+            target_fmt = "https"
+        else:
+            new_url = build_ssh_url(acc, owner, repo)
+
+    if target_fmt == "https":
+        new_url = build_https_url(token, host, owner, repo)
+
+    set_remote_url("origin", new_url, dry_run=args.dry_run)
+
+
+# ─── Command: remove ───────────────────────────────────────────────────────────
+def cmd_remove(args: argparse.Namespace) -> None:
+    """
+    Remove an account:
+      1. Delete its stanza from ~/.ssh/config
+      2. Remove it from accounts.toml
+      3. Optionally delete the SSH key files (--delete-keys)
+    """
+    acc = find_account(args.username)
+    if not acc:
+        die(f"Account '{args.username}' not found. Run: git-id list", EXIT_INPUT)
+
+    if not args.yes:
+        host = acc.get("host", "github.com")
+        print(f"\n  {_c('yellow', 'About to remove account:')} {_c('bold', acc['username'])}  {_c('dim', host)}")
+        print(f"    email: {acc.get('email')}")
+        ssh_key = acc.get("ssh_key", "")
+        if ssh_key:
+            print(f"    key  : {ssh_key}")
+        ans = input("\n  Confirm removal? [y/N]: ").strip().lower()
+        if ans != "y":
+            info("Aborted.")
+            sys.exit(EXIT_OK)
+
+    # 1. Remove SSH config stanza
+    if SSH_CONFIG.exists():
+        acct_id  = _account_id(acc)
+        content  = SSH_CONFIG.read_text()
+        start_m  = re.escape(MARKER_S.format(id=acct_id))
+        end_m    = re.escape(MARKER_E.format(id=acct_id))
+        pattern  = re.compile(rf"\n?{start_m}.*?{end_m}\n?", re.DOTALL)
+        new_content = pattern.sub("", content)
+        if new_content != content:
+            if args.dry_run:
+                info(f"[dry-run] Would remove SSH config stanza for '{acct_id}'")
+            else:
+                backup(SSH_CONFIG)
+                SSH_CONFIG.write_text(new_content)
+                SSH_CONFIG.chmod(0o600)
+                ok(f"Removed SSH config stanza for '{acct_id}'")
+        else:
+            info(f"No SSH config stanza found for '{acct_id}' — skipping")
+
+    # 2. Remove from accounts.toml
+    uid = _account_id(acc)
+    accounts     = load_accounts()
+    new_accounts = [a for a in accounts if _account_id(a) != uid]
+    save_accounts(new_accounts, dry_run=args.dry_run)
+
+    # 3. Optionally delete key files
+    ssh_key_str = acc.get("ssh_key", "")
+    if ssh_key_str:
+        priv = Path(ssh_key_str).expanduser()
+        pub  = priv.with_suffix(".pub")
+        if args.delete_keys:
+            for f in (priv, pub):
+                if f.exists():
+                    if args.dry_run:
+                        info(f"[dry-run] Would delete {f}")
+                    else:
+                        f.unlink()
+                        ok(f"Deleted {f}")
+        else:
+            existing = [str(f) for f in (priv, pub) if f.exists()]
+            if existing:
+                info("SSH key files kept (use --delete-keys to also remove them):")
+                for f in existing:
+                    print(f"    {_c('dim', f)}")
+
+    if not args.dry_run:
+        ok(f"Account '{_account_id(acc)}' removed.")
+
+
+# ─── Command: ssh gen ──────────────────────────────────────────────────────────
+def cmd_ssh_gen(args: argparse.Namespace) -> None:
+    acc = find_account(args.username)
+    if not acc:
+        die(f"Account '{args.username}' not found.", EXIT_INPUT)
+
+    username = acc["username"]
+    key = gen_ssh_key(username, acc.get("email", ""), dry_run=args.dry_run)
+    fix_key_permissions(key)
+
+    accounts = load_accounts()
+    for a in accounts:
+        if _account_id(a) == _account_id(acc):
+            a["ssh_key"] = str(key)
+    save_accounts(accounts, dry_run=args.dry_run)
+    update_ssh_config(accounts, dry_run=args.dry_run)
+
+    pub = key.with_suffix(".pub")
+    if pub.exists() and not args.dry_run:
+        hdr("Public key — paste into GitHub → Settings → SSH keys:")
+        print(f"\n{pub.read_text().strip()}\n")
+
+
+# ─── Command: ssh pick ─────────────────────────────────────────────────────────
+def cmd_ssh_pick(args: argparse.Namespace) -> None:
+    acc = find_account(args.username)
+    if not acc:
+        die(f"Account '{args.username}' not found.", EXIT_INPUT)
+
+    pub_files = sorted(SSH_DIR.glob("*.pub"))
+    if not pub_files:
+        die("No .pub files found in ~/.ssh/", EXIT_ERR)
+
+    hdr(f"Pick SSH key for '{args.username}'")
+    chosen = choose_from_list([str(p) for p in pub_files], "Select public key")
+    if not chosen:
+        die("No key selected.", EXIT_INPUT)
+
+    pub  = Path(chosen)
+    priv = pub.with_suffix("")
+
+    if not priv.exists():
+        warn(f"Private key not found: {priv}")
+        yn = input("  Generate a new ed25519 key instead? [y/N]: ").strip().lower()
+        if yn == "y":
+            priv = gen_ssh_key(acc["username"], acc.get("email", ""), dry_run=args.dry_run)
+        else:
+            die("Cannot proceed without a private key.", EXIT_INPUT)
+    else:
+        fix_key_permissions(priv)
+        add_key_to_agent(priv, dry_run=args.dry_run)
+
+    accounts = load_accounts()
+    for a in accounts:
+        if _account_id(a) == _account_id(acc):
+            a["ssh_key"] = str(priv)
+    save_accounts(accounts, dry_run=args.dry_run)
+    update_ssh_config(accounts, dry_run=args.dry_run)
+    ok(f"SSH key for '{args.username}' → {priv}")
+
+
+# ─── Command: ssh config ───────────────────────────────────────────────────────
+def cmd_ssh_config(args: argparse.Namespace) -> None:
+    accounts = load_accounts()
+    if not accounts:
+        info("No accounts configured. Run: git-id add")
+        return
+    update_ssh_config(accounts, dry_run=args.dry_run)
+    hdr("Generated SSH config stanzas:")
+    for acc in accounts:
+        print(_make_stanza(acc))
+
+
+# ─── Command: status ───────────────────────────────────────────────────────────
+def cmd_status(args: argparse.Namespace) -> None:
+    hdr("git-id status")
+
+    g_name  = get_git_config("user.name",  "global")
+    g_email = get_git_config("user.email", "global")
+    print(f"\n  {_c('bold', 'Global git identity')}")
+    print(f"    name : {g_name  or _c('dim', '(not set)')}")
+    print(f"    email: {g_email or _c('dim', '(not set)')}")
+
+    if in_git_repo():
+        l_name  = get_git_config("user.name",  "local")
+        l_email = get_git_config("user.email", "local")
+        remote  = get_remote_url("origin")
+        print(f"\n  {_c('bold', 'Repo identity')}  ({_c('dim', _repo_name())})")
+        print(f"    name  : {l_name  or _c('dim', '(inherits global)')}")
+        print(f"    email : {l_email or _c('dim', '(inherits global)')}")
+        print(f"    origin: {remote  or _c('dim', '(no remote)')}")
+    else:
+        print(f"\n  {_c('dim', '(not in a git repository)')}")
+
+    result = _run(["ssh-add", "-l"])
+    print(f"\n  {_c('bold', 'ssh-agent keys')}")
+    if result.returncode == 0 and result.stdout.strip():
+        for line in result.stdout.strip().splitlines():
+            print(f"    {_c('green', '✓')} {line}")
+    else:
+        print(f"    {_c('dim', '(no keys loaded, or agent not running)')}")
+
+    active_email = (get_git_config("user.email", "local") if in_git_repo() else "") or g_email
+    if active_email:
+        accounts = load_accounts()
+        matched  = [a for a in accounts if a.get("email") == active_email]
+        if matched:
+            m = matched[0]
+            print(f"\n  {_c('bold', 'Matched account')}: {_c('green', m['username'])}  {_c('dim', m.get('host', 'github.com'))}")
+        else:
+            print(f"\n  {_c('dim', 'Active email does not match any configured account')}")
+    print()
+
+
+# ─── Argument parser ───────────────────────────────────────────────────────────
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="git-id",
+        description="Manage multiple GitHub accounts on one machine.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+commands:
+  add                      Interactive wizard to add a new account
+  list                     Show all accounts with status indicators
+  use <username>           Set git identity (+ update remote URL) for current repo
+  remove <username>        Remove an account (+ SSH config stanza)
+  ssh gen  <username>      Generate a new ed25519 SSH key
+  ssh pick <username>      Pick an existing ~/.ssh/*.pub key
+  ssh config               Write/update ~/.ssh/config stanzas for all accounts
+  status                   Show current active identity and loaded SSH keys
+
+  <username> can be bare (johndoe) or qualified (johndoe@corp.github.com)
+  Use the qualified form when the same username exists on multiple hosts.
+
+examples:
+  git-id add
+  git-id list
+  git-id use johndoe
+  git-id use johndoe --global
+  git-id use johndoe@corp.github.com       # disambiguate by host
+  git-id use johndoe --ssh                 # force SSH remote URL
+  git-id use johndoe --https               # force HTTPS remote URL
+  git-id remove johndoe
+  git-id remove johndoe --yes --delete-keys
+  git-id ssh gen  johndoe
+  git-id ssh pick johndoe
+  git-id ssh config
+  git-id status
+  git-id --dry-run use johndoe
+""",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview changes without modifying any files",
+    )
+    parser.add_argument("--version", action="version", version="git-id 1.0.0")
+
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+
+    # add
+    sub.add_parser("add", help="Add a new account (interactive wizard)")
+
+    # list
+    sub.add_parser("list", help="List all accounts with status")
+
+    # use
+    p_use = sub.add_parser("use", help="Set identity for repo or globally")
+    p_use.add_argument("username", help="GitHub username (or username@host)")
+    p_use.add_argument(
+        "--global", dest="glob", action="store_true",
+        help="Apply to global git config instead of current repo",
+    )
+    p_use.add_argument("--ssh",   dest="force_ssh",   action="store_true",
+                       help="Convert remote URL to SSH format")
+    p_use.add_argument("--https", dest="force_https", action="store_true",
+                       help="Convert remote URL to HTTPS format")
+
+    # remove
+    p_rm = sub.add_parser("remove", help="Remove an account and its SSH config stanza")
+    p_rm.add_argument("username", help="GitHub username (or username@host)")
+    p_rm.add_argument("--yes", "-y", action="store_true",
+                      help="Skip confirmation prompt")
+    p_rm.add_argument("--delete-keys", action="store_true",
+                      help="Also delete the SSH private and public key files")
+
+    # ssh
+    p_ssh   = sub.add_parser("ssh", help="SSH key management subcommands")
+    ssh_sub = p_ssh.add_subparsers(dest="ssh_command", metavar="<subcommand>")
+
+    p_gen = ssh_sub.add_parser("gen", help="Generate a new ed25519 key")
+    p_gen.add_argument("username", help="GitHub username (or username@host)")
+
+    p_pick = ssh_sub.add_parser("pick", help="Pick an existing ~/.ssh/*.pub key")
+    p_pick.add_argument("username", help="GitHub username (or username@host)")
+
+    ssh_sub.add_parser("config", help="Write ~/.ssh/config stanzas for all accounts")
+
+    # status
+    sub.add_parser("status", help="Show current identity and loaded SSH keys")
+
+    return parser
+
+
+# ─── Main ──────────────────────────────────────────────────────────────────────
+def main() -> None:
+    # Pre-extract --dry-run so it works anywhere in the command line
+    raw_argv = sys.argv[1:]
+    dry_run  = "--dry-run" in raw_argv
+    argv     = [a for a in raw_argv if a != "--dry-run"]
+
+    parser = build_parser()
+    args   = parser.parse_args(argv)
+    args.dry_run = dry_run
+
+    # Defaults for flags that only some subcommands define
+    for attr, default in [("glob", False), ("force_ssh", False), ("force_https", False)]:
+        if not hasattr(args, attr):
+            setattr(args, attr, default)
+
+    dispatch = {
+        "add":    cmd_add,
+        "list":   cmd_list,
+        "use":    cmd_use,
+        "remove": cmd_remove,
+        "status": cmd_status,
+    }
+
+    if args.command in dispatch:
+        dispatch[args.command](args)
+
+    elif args.command == "ssh":
+        ssh_dispatch = {
+            "gen":    cmd_ssh_gen,
+            "pick":   cmd_ssh_pick,
+            "config": cmd_ssh_config,
+        }
+        if args.ssh_command in ssh_dispatch:
+            ssh_dispatch[args.ssh_command](args)
+        else:
+            parser.parse_args(["ssh", "--help"])
+            sys.exit(EXIT_INPUT)
+
+    else:
+        parser.print_help()
+        sys.exit(EXIT_INPUT)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(EXIT_INPUT)
+
+
+# ─── Manual test checklist ─────────────────────────────────────────────────────
+# 1.  git-id list                  → creates accounts.toml, "no accounts" message
+# 2.  git-id add                   → wizard: username=johndoe, gen SSH key
+# 3.  git-id list                  → shows johndoe + key status
+# 4.  git-id use johndoe           → sets local identity + updates SSH remote URL
+# 5.  git-id use johndoe --global  → sets global identity
+# 6.  git-id use johndoe --https   → converts remote to HTTPS with token
+# 7.  git-id ssh gen johndoe       → generates key, updates config
+# 8.  git-id ssh pick johndoe      → pick key interactively
+# 9.  git-id ssh config            → rewrites ~/.ssh/config, idempotent
+# 10. git-id status                → shows current identity + agent keys
+# 11. git-id remove johndoe        → confirm prompt, removes entry + stanza
+# 12. git-id remove johndoe --yes --delete-keys  → also deletes key files
+# 13. git-id --dry-run use johndoe → preview only, no writes
+# 14. git-id use johndoe@corp.github.com  → GHE disambiguation
+# 15. git-id use nonexistent       → exit 2, clear error
+# 16. ls ~/.ssh/config.bak.*       → backup created before each write
