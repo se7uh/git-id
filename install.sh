@@ -58,11 +58,14 @@ mkdir -p "$INSTALL_DIR"
 
 # Download binary
 echo "Downloading $ASSET..."
+# Download to a temporary file first to avoid leaving a corrupted binary on failure
+TMP_FILE="$(mktemp "$INSTALL_DIR/git-id.XXXXXX")" || { echo "Failed to create temporary file" >&2; exit 1; }
 if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$DOWNLOAD_URL" -o "$INSTALL_DIR/git-id"
+  curl -fsSL "$DOWNLOAD_URL" -o "$TMP_FILE"
 else
-  wget -qO "$INSTALL_DIR/git-id" "$DOWNLOAD_URL"
+  wget -qO "$TMP_FILE" "$DOWNLOAD_URL"
 fi
+mv "$TMP_FILE" "$INSTALL_DIR/git-id"
 
 chmod +x "$INSTALL_DIR/git-id"
 
