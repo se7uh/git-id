@@ -18,9 +18,8 @@ case "$OS" in
     ;;
   Darwin)
     case "$ARCH" in
-      x86_64)  ASSET="git-id-x86_64-macos" ;;
       arm64)   ASSET="git-id-aarch64-macos" ;;
-      *)       echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+      *)       echo "Unsupported architecture: $ARCH (only Apple Silicon is supported)" >&2; exit 1 ;;
     esac
     ;;
   *)
@@ -96,11 +95,6 @@ echo ""
 echo "git-id installed to $INSTALL_DIR/git-id"
 echo ""
 echo "Make sure $INSTALL_DIR is in your PATH."
-echo "For Bash or Zsh, add this line to your ~/.bashrc or ~/.zshrc:"
-echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-echo ""
-echo "For Fish, add this line to your ~/.config/fish/config.fish:"
-echo "  set -gx PATH \$HOME/.local/bin \$PATH"
 echo ""
 echo "To enable shell completions, run:"
 echo "  git-id completions bash   # for Bash"
