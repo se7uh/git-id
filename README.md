@@ -25,8 +25,18 @@ git id use alice
 
 ## Installation
 
+Supports Linux and macOS on x86_64 and aarch64 (Apple Silicon).
+
 ```
 curl -fsSL https://raw.githubusercontent.com/se7uh/git-id/main/install.sh | sh
+```
+
+The script downloads the correct pre-built binary from the latest release and places it in `~/.local/bin`. Make sure that directory is in your `PATH`.
+
+To build from source instead:
+
+```
+cargo install --path .
 ```
 
 ---
