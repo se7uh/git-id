@@ -25,7 +25,7 @@ git id use alice
 
 ## Installation
 
-Supports Linux and macOS on x86_64 and aarch64 (Apple Silicon).
+Supports Linux (x86_64, aarch64) and macOS (Apple Silicon).
 
 ```
 curl -fsSL https://raw.githubusercontent.com/se7uh/git-id/main/install.sh | sh
