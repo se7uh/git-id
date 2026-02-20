@@ -21,7 +21,7 @@ jobs:
             binary: git-id
             asset: git-id-aarch64-linux
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-13
             binary: git-id
             asset: git-id-x86_64-macos
           - target: aarch64-apple-darwin
@@ -59,11 +59,21 @@ jobs:
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.asset }}
 
+      - name: Generate SHA256 checksum
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          else
+            shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
+          fi
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
 
   release:
     name: Create Release
@@ -106,5 +116,5 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: v${{ steps.version.outputs.version }}
-          files: artifacts/**/*
+          files: artifacts/*/*
           fail_on_unmatched_files: true
