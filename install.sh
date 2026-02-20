@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="dgfsdw/git-id"
+REPO="se7uh/git-id"
 INSTALL_DIR="$HOME/.local/bin"
 
 # Detect OS and architecture
