@@ -53,26 +53,54 @@ if [ -z "$DOWNLOAD_URL" ]; then
   exit 1
 fi
 
+# Determine SHA256 checksum URL
+CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+
 # Create install directory if it doesn't exist
 mkdir -p "$INSTALL_DIR"
 
-# Download binary
+# Download binary to a temporary file first to avoid leaving a corrupted binary on failure
 echo "Downloading $ASSET..."
-# Download to a temporary file first to avoid leaving a corrupted binary on failure
 TMP_FILE="$(mktemp "$INSTALL_DIR/git-id.XXXXXX")" || { echo "Failed to create temporary file" >&2; exit 1; }
 if command -v curl >/dev/null 2>&1; then
   curl -fsSL "$DOWNLOAD_URL" -o "$TMP_FILE"
+  CHECKSUM_LINE="$(curl -fsSL "$CHECKSUM_URL")" || { rm -f "$TMP_FILE"; echo "Failed to download checksum file" >&2; exit 1; }
 else
   wget -qO "$TMP_FILE" "$DOWNLOAD_URL"
+  CHECKSUM_LINE="$(wget -qO- "$CHECKSUM_URL")" || { rm -f "$TMP_FILE"; echo "Failed to download checksum file" >&2; exit 1; }
 fi
-mv "$TMP_FILE" "$INSTALL_DIR/git-id"
 
+# Verify SHA256 checksum
+EXPECTED_HASH="$(echo "$CHECKSUM_LINE" | awk '{print $1}')"
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_HASH="$(sha256sum "$TMP_FILE" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL_HASH="$(shasum -a 256 "$TMP_FILE" | awk '{print $1}')"
+else
+  echo "Warning: sha256sum/shasum not found, skipping checksum verification" >&2
+  ACTUAL_HASH="$EXPECTED_HASH"
+fi
+
+if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
+  rm -f "$TMP_FILE"
+  echo "Checksum verification failed!" >&2
+  echo "  Expected: $EXPECTED_HASH" >&2
+  echo "  Got:      $ACTUAL_HASH" >&2
+  exit 1
+fi
+
+mv "$TMP_FILE" "$INSTALL_DIR/git-id"
 chmod +x "$INSTALL_DIR/git-id"
 
 echo ""
 echo "git-id installed to $INSTALL_DIR/git-id"
 echo ""
 echo "Make sure $INSTALL_DIR is in your PATH."
+echo "For Bash or Zsh, add this line to your ~/.bashrc or ~/.zshrc:"
+echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+echo ""
+echo "For Fish, add this line to your ~/.config/fish/config.fish:"
+echo "  set -gx PATH \$HOME/.local/bin \$PATH"
 echo ""
 echo "To enable shell completions, run:"
 echo "  git-id completions bash   # for Bash"
