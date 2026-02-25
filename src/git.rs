@@ -47,6 +47,18 @@ pub fn get_remote_url(remote: &str) -> String {
     if code == 0 { url } else { String::new() }
 }
 
+pub fn list_remotes() -> Vec<String> {
+    let (code, out, _) = run_git(&["remote"]);
+    if code != 0 {
+        return vec![];
+    }
+    out.lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 /// Strips a git-id username suffix from an SSH host alias.
 /// e.g. "github.com-alice" → "github.com", "github.com" → "github.com"
 /// A suffix is recognised as a username when it contains no dots.
