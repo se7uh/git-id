@@ -4,7 +4,7 @@ use clap_complete::Shell;
 #[derive(Parser)]
 #[command(
     name = "git-id",
-    version = "1.0.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Manage multiple GitHub accounts on one machine."
 )]
 pub struct Cli {
