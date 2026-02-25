@@ -52,8 +52,31 @@ if [ -z "$DOWNLOAD_URL" ]; then
   exit 1
 fi
 
-# Determine SHA256 checksum URL
-CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+# Fetch checksums (single file in the release)
+CHECKSUM_ASSET="SHA256SUMS"
+
+# Fetch the checksum file download URL
+if command -v curl >/dev/null 2>&1; then
+  if command -v jq >/dev/null 2>&1; then
+    CHECKSUM_URL="$(curl -fsSL "$API_URL" | jq -r --arg name "$CHECKSUM_ASSET" '.assets[] | select(.name == $name) | .browser_download_url' | head -n 1)"
+  else
+    CHECKSUM_URL="$(curl -fsSL "$API_URL" | grep '"browser_download_url"' | grep "$CHECKSUM_ASSET" | sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  fi
+elif command -v wget >/dev/null 2>&1; then
+  if command -v jq >/dev/null 2>&1; then
+    CHECKSUM_URL="$(wget -qO- "$API_URL" | jq -r --arg name "$CHECKSUM_ASSET" '.assets[] | select(.name == $name) | .browser_download_url' | head -n 1)"
+  else
+    CHECKSUM_URL="$(wget -qO- "$API_URL" | grep '"browser_download_url"' | grep "$CHECKSUM_ASSET" | sed -n 's/.*"browser_download_url":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  fi
+else
+  echo "curl or wget is required" >&2
+  exit 1
+fi
+
+if [ -z "$CHECKSUM_URL" ]; then
+  echo "Could not find download URL for $CHECKSUM_ASSET" >&2
+  exit 1
+fi
 
 # Create install directory if it doesn't exist
 mkdir -p "$INSTALL_DIR"
@@ -63,13 +86,19 @@ echo "Downloading $ASSET..."
 TMP_FILE="$(mktemp "$INSTALL_DIR/git-id.XXXXXX")" || { echo "Failed to create temporary file" >&2; exit 1; }
 if command -v curl >/dev/null 2>&1; then
   curl -fsSL "$DOWNLOAD_URL" -o "$TMP_FILE"
-  CHECKSUM_LINE="$(curl -fsSL "$CHECKSUM_URL")" || { rm -f "$TMP_FILE"; echo "Failed to download checksum file" >&2; exit 1; }
+  CHECKSUMS_CONTENT="$(curl -fsSL "$CHECKSUM_URL")" || { rm -f "$TMP_FILE"; echo "Failed to download checksum file" >&2; exit 1; }
 else
   wget -qO "$TMP_FILE" "$DOWNLOAD_URL"
-  CHECKSUM_LINE="$(wget -qO- "$CHECKSUM_URL")" || { rm -f "$TMP_FILE"; echo "Failed to download checksum file" >&2; exit 1; }
+  CHECKSUMS_CONTENT="$(wget -qO- "$CHECKSUM_URL")" || { rm -f "$TMP_FILE"; echo "Failed to download checksum file" >&2; exit 1; }
 fi
 
 # Verify SHA256 checksum
+CHECKSUM_LINE="$(printf '%s\n' "$CHECKSUMS_CONTENT" | grep -E "  ${ASSET}$" | head -n 1)"
+if [ -z "$CHECKSUM_LINE" ]; then
+  rm -f "$TMP_FILE"
+  echo "Checksum line not found for $ASSET in $CHECKSUM_ASSET" >&2
+  exit 1
+fi
 EXPECTED_HASH="$(echo "$CHECKSUM_LINE" | awk '{print $1}')"
 if command -v sha256sum >/dev/null 2>&1; then
   ACTUAL_HASH="$(sha256sum "$TMP_FILE" | awk '{print $1}')"

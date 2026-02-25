@@ -60,21 +60,12 @@ jobs:
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.asset }}
 
-      - name: Generate SHA256 checksum
-        run: |
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
-          else
-            shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
-          fi
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: |
             ${{ matrix.asset }}
-            ${{ matrix.asset }}.sha256
 
   release:
     name: Create Release
@@ -113,13 +104,26 @@ jobs:
         with:
           path: artifacts
 
+      - name: Build SHA256SUMS
+        if: steps.check_release.outputs.exists == 'false'
+        run: |
+          set -e
+          for f in artifacts/*/*; do
+            b=$(basename "$f")
+            sha256sum "$f" | awk -v b="$b" '{print $1 "  " b}'
+          done | sort -k2 > SHA256SUMS
+
       - name: Create GitHub Release
         if: steps.check_release.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: v${{ steps.version.outputs.version }}
-          files: artifacts/*/*
+          files: |
+            artifacts/git-id-x86_64-linux/git-id-x86_64-linux
+            artifacts/git-id-aarch64-linux/git-id-aarch64-linux
+            artifacts/git-id-aarch64-macos/git-id-aarch64-macos
+            SHA256SUMS
           fail_on_unmatched_files: true
 
   publish:
