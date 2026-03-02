@@ -1,5 +1,7 @@
 # git-id
 
+[![asciicast](https://asciinema.org/a/805278.svg)](https://asciinema.org/a/805278)
+
 A command-line tool to manage any number of GitHub accounts on one machine.
 
 If you use several GitHub accounts, switching identities and remote URLs by hand gets messy quickly. `git-id` keeps every account registered in one place and switches the right identity and remote with a single command, no matter how many accounts you have.
